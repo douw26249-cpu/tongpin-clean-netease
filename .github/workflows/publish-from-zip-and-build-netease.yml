@@ -1,0 +1,103 @@
+name: Extract ZIP and build Tongpin Clean APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      zip_name:
+        description: ZIP file name in repository root
+        required: true
+        default: tongpin-clean-public-beta-netease.zip
+
+permissions:
+  contents: write
+
+jobs:
+  publish-and-build:
+    name: Extract source and build APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      ZIP_NAME: ${{ inputs.zip_name || 'tongpin-clean-public-beta-netease.zip' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check uploaded ZIP
+        run: |
+          set -eux
+          test -f "$ZIP_NAME"
+          ls -lh "$ZIP_NAME"
+
+      - name: Unzip source and replace repository content
+        run: |
+          set -eux
+          rm -rf /tmp/tongpin-unpack
+          mkdir -p /tmp/tongpin-unpack
+          unzip -q "$ZIP_NAME" -d /tmp/tongpin-unpack
+
+          ANDROID_DIR="$(find /tmp/tongpin-unpack -type d -path '*/apps/android' | head -n 1)"
+          if [ -z "$ANDROID_DIR" ]; then
+            echo "Cannot find apps/android inside ZIP"
+            find /tmp/tongpin-unpack -maxdepth 5 -type d
+            exit 1
+          fi
+
+          PROJECT_ROOT="$(dirname "$(dirname "$ANDROID_DIR")")"
+          rsync -a --delete "$PROJECT_ROOT"/ ./ \
+            --exclude='.git/' \
+            --exclude='.github/'
+
+          find . -maxdepth 1 -type f -name '*.zip' -print -delete || true
+          test -f README.md
+          test -d apps/android
+          test -d services/server
+
+      - name: Commit extracted source
+        run: |
+          set -eux
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No repository changes to commit."
+          else
+            git commit -m "Publish Tongpin Clean NetEase lyrics build"
+            git push
+          fi
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.10.2
+
+      - name: Build debug APK
+        run: gradle -p apps/android assembleDebug --no-daemon --console=plain
+
+      - name: Prepare APK artifact
+        run: |
+          mkdir -p output
+          cp apps/android/app/build/outputs/apk/debug/app-debug.apk output/tongpin-clean-netease-debug.apk
+          ls -lh output
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: tongpin-clean-netease-apk
+          path: output/tongpin-clean-netease-debug.apk
