@@ -38,7 +38,26 @@ jobs:
           set -eux
           rm -rf /tmp/tongpin-unpack
           mkdir -p /tmp/tongpin-unpack
-          unzip -q "$ZIP_NAME" -d /tmp/tongpin-unpack
+          python3 - "$ZIP_NAME" /tmp/tongpin-unpack <<'PY'
+          import pathlib
+          import sys
+          import zipfile
+
+          archive_path = pathlib.Path(sys.argv[1])
+          output_root = pathlib.Path(sys.argv[2]).resolve()
+          with zipfile.ZipFile(archive_path) as archive:
+              for info in archive.infolist():
+                  safe_name = info.filename.replace(chr(92), "/").lstrip("/")
+                  target = (output_root / safe_name).resolve()
+                  if output_root not in target.parents and target != output_root:
+                      raise RuntimeError(f"Unsafe ZIP entry: {info.filename}")
+                  if info.is_dir():
+                      target.mkdir(parents=True, exist_ok=True)
+                      continue
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  with archive.open(info) as source, target.open("wb") as destination:
+                      destination.write(source.read())
+          PY
 
           ANDROID_DIR="$(find /tmp/tongpin-unpack -type d -path '*/apps/android' | head -n 1)"
           if [ -z "$ANDROID_DIR" ]; then
@@ -101,3 +120,4 @@ jobs:
         with:
           name: tongpin-clean-netease-apk
           path: output/tongpin-clean-netease-debug.apk
+
