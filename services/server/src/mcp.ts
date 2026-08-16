@@ -1,0 +1,132 @@
+import type { Request, Response } from 'express';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import * as z from 'zod/v4';
+import type { RoomStore } from './store.js';
+import { toPublicRoom } from './types.js';
+
+const textResult = (value: unknown) => ({
+  content: [{ type: 'text' as const, text: JSON.stringify(value, null, 2) }]
+});
+
+export function createMcpServer(store: RoomStore): McpServer {
+  const server = new McpServer({ name: 'tongpin-clean', version: '1.3.1' });
+
+  server.registerTool('create_room', {
+    title: '创建同频房间',
+    description: '创建新的共同听歌房间，返回房间码与私密密钥。适用于 ChatGPT、Claude、Gemini SDK 或其他支持 MCP 的 AI 客户端。',
+    inputSchema: {}
+  }, async () => {
+    const room = await store.create();
+    return textResult({ ok: true, code: room.code, roomSecret: room.secret });
+  });
+
+  server.registerTool('get_room', {
+    title: '读取同频房间',
+    description: '读取当前歌曲、当前播放器（QQ 音乐 / 酷狗音乐 / 网易云音乐 / 其他媒体会话）、进度、播放状态、当前与下一句同步歌词、命令执行结果和听歌笔记。',
+    inputSchema: {
+      code: z.string().min(6),
+      roomSecret: z.string().min(10)
+    }
+  }, async ({ code, roomSecret }) => {
+    try {
+      return textResult({ ok: true, room: toPublicRoom(store.authenticate(code, roomSecret)) });
+    } catch {
+      return textResult({ ok: false, error: '房间不存在或密钥错误' });
+    }
+  });
+
+  server.registerTool('set_playback_command', {
+    title: '控制同频播放',
+    description: '向手机当前选中的播放器发送播放、暂停、上一首、下一首或跳转进度命令。支持 QQ 音乐、酷狗音乐、网易云音乐的基础媒体会话控制；调用后需等待手机后台服务领取并回传执行结果。',
+    inputSchema: {
+      code: z.string().min(6),
+      roomSecret: z.string().min(10),
+      command: z.enum(['play', 'pause', 'seek', 'next', 'previous']),
+      positionMs: z.number().int().nonnegative().optional()
+    }
+  }, async ({ code, roomSecret, command, positionMs }) => {
+    if (command === 'seek' && positionMs === undefined) {
+      return textResult({ ok: false, error: 'seek 命令必须提供 positionMs' });
+    }
+    try {
+      const room = await store.setCommand(code, roomSecret, { type: command, positionMs });
+      return textResult({ ok: true, command: room.pendingCommand, result: room.lastCommandResult });
+    } catch {
+      return textResult({ ok: false, error: '房间不存在或密钥错误' });
+    }
+  });
+
+
+  server.registerTool('search_and_play', {
+    title: '搜索并播放歌曲',
+    description: '让手机自动搜索指定歌曲并开始播放。优先使用系统媒体搜索；QQ 音乐不响应时，可由已授权的无障碍服务自动打开 QQ 音乐、输入关键词并点击最匹配结果。',
+    inputSchema: {
+      code: z.string().min(6),
+      roomSecret: z.string().min(10),
+      title: z.string().min(1).max(160),
+      artist: z.string().max(160).optional()
+    }
+  }, async ({ code, roomSecret, title, artist }) => {
+    try {
+      const cleanTitle = title.trim();
+      const cleanArtist = artist?.trim() ?? '';
+      const query = [cleanTitle, cleanArtist].filter(Boolean).join(' ');
+      const room = await store.setCommand(code, roomSecret, {
+        type: 'search_play',
+        query,
+        title: cleanTitle,
+        artist: cleanArtist || undefined
+      });
+      return textResult({ ok: true, command: room.pendingCommand, result: room.lastCommandResult });
+    } catch {
+      return textResult({ ok: false, error: '房间不存在或密钥错误' });
+    }
+  });
+
+  server.registerTool('add_listening_note', {
+    title: '添加听歌笔记',
+    description: '在当前歌曲与进度附近记录一句话。',
+    inputSchema: {
+      code: z.string().min(6),
+      roomSecret: z.string().min(10),
+      text: z.string().min(1).max(500),
+      positionMs: z.number().int().nonnegative().optional()
+    }
+  }, async ({ code, roomSecret, text, positionMs }) => {
+    try {
+      const room = await store.addNote(code, roomSecret, text, positionMs);
+      return textResult({ ok: true, note: room.notes.at(-1) });
+    } catch {
+      return textResult({ ok: false, error: '房间不存在或密钥错误' });
+    }
+  });
+
+  return server;
+}
+
+export async function handleMcpRequest(store: RoomStore, req: Request, res: Response): Promise<void> {
+  const server = createMcpServer(store);
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: undefined,
+    enableJsonResponse: true
+  });
+  let closed = false;
+  const close = async () => {
+    if (closed) return;
+    closed = true;
+    await transport.close();
+    await server.close();
+  };
+  res.once('finish', () => void close());
+  res.once('close', () => void close());
+  try {
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+  } catch (error) {
+    console.error('MCP request failed', error);
+    if (!res.headersSent) {
+      res.status(500).json({ jsonrpc: '2.0', error: { code: -32603, message: 'Internal server error' }, id: null });
+    }
+  }
+}
