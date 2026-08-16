@@ -51,7 +51,7 @@ jobs:
                   target = (output_root / safe_name).resolve()
                   if output_root not in target.parents and target != output_root:
                       raise RuntimeError(f"Unsafe ZIP entry: {info.filename}")
-                  if info.is_dir():
+                  if info.is_dir() or info.filename.endswith(("/", chr(92))):
                       target.mkdir(parents=True, exist_ok=True)
                       continue
                   target.parent.mkdir(parents=True, exist_ok=True)
